@@ -4,3 +4,5 @@
 *.jl.*.cov
 docs/build
 /Manifest.toml
+.DS_Store
+/test/registries/*

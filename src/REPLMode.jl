@@ -9,7 +9,7 @@ import REPL
 import REPL: LineEdit, REPLCompletions
 
 import ..devdir, ..Types.casesensitive_isdir, ..TOML
-using ..Types, ..Display, ..Operations, ..API
+using ..Types, ..Display, ..Operations, ..API, ..Registry
 
 #################
 # Git revisions #
@@ -92,7 +92,7 @@ meta_option_specs = OptionSpecs(meta_option_declarations)
                    CMD_STATUS, CMD_TEST, CMD_GC, CMD_BUILD, CMD_PIN,
                    CMD_FREE, CMD_GENERATE, CMD_RESOLVE, CMD_PRECOMPILE,
                    CMD_INSTANTIATE, CMD_ACTIVATE, CMD_PREVIEW,
-                   CMD_REGISTRY_ADD,
+                   CMD_REGISTRY_ADD, CMD_REGISTRY_RM, CMD_REGISTRY_UP, CMD_REGISTRY_STATUS,
                    )
 @enum(ArgClass, ARG_RAW, ARG_PKG, ARG_VERSION, ARG_REV, ARG_ALL)
 struct ArgSpec
@@ -152,9 +152,9 @@ function CommandSpecs(declarations::Vector{CommandDeclaration})::Dict{String,Com
     return specs
 end
 
-###################
-# Package parsing #
-###################
+############################
+# Package/registry parsing #
+############################
 let uuid = raw"(?i)[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}(?-i)",
     name = raw"(\w+)(?:\.jl)?"
     global const name_re = Regex("^$name\$")
@@ -182,6 +182,41 @@ function parse_package(word::AbstractString; add_or_develop=false)::PackageSpec
         pkgerror("`$word` cannot be parsed as a package")
     end
 end
+
+# Registries can be identified through: uuid, name, or name+uuid
+# when updating/removing. When adding we can accept a local path or url.
+function parse_registry(word::AbstractString; add=false)::RegistrySpec
+    word = replace(word, "~" => homedir())
+    registry = RegistrySpec()
+    if add && Types.isdir_windows_workaround(word) # TODO: Should be casesensitive_isdir
+        if isdir(joinpath(word, ".git")) # add path as url and clone it from there
+            registry.url = abspath(word)
+        else # put the path
+            registry.path = abspath(word)
+        end
+    elseif occursin(uuid_re, word)
+        registry.uuid = UUID(word)
+    elseif occursin(name_re, word)
+        registry.name = String(match(name_re, word).captures[1])
+    elseif occursin(name_uuid_re, word)
+        m = match(name_uuid_re, word)
+        registry.name = String(m.captures[1])
+        registry.uuid = UUID(m.captures[2])
+    elseif add
+        # Guess it is a url then
+        registry.url = String(word)
+    else
+        pkgerror("`$word` cannot be parsed as a registry")
+    end
+    return registry
+end
+
+function parse_registry(raw_args::Vector{String}; add=false)
+    regs = RegistrySpec[]
+    foreach(x -> push!(regs, parse_registry(x; add=add)), raw_args)
+    return regs
+end
+
 
 ################
 # REPL parsing #
@@ -320,7 +355,7 @@ end
 const Token = Union{String, VersionRange, Rev}
 const ArgToken = Union{VersionRange, Rev}
 const PkgToken = Union{String, VersionRange, Rev}
-const PkgArguments = Union{Vector{String}, Vector{PackageSpec}}
+const PkgArguments = Union{Vector{String}, Vector{PackageSpec}, Vector{RegistrySpec}}
 struct PkgCommand
     meta_options::Vector{Option}
     spec::CommandSpec
@@ -564,14 +599,6 @@ function do_test!(ctx::APIOptions, args::PkgArguments, api_opts::APIOptions)
     API.test(Context!(ctx), args; collect(api_opts)...)
 end
 
-function do_registry_add!(ctx::APIOptions, args::PkgArguments, api_opts::APIOptions)
-    println("This is a dummy function for now")
-    println("My args are:")
-    for arg in args
-        println("- $arg")
-    end
-end
-
 do_precompile!(ctx::APIOptions, args::PkgArguments, api_opts::APIOptions) =
     API.precompile(Context!(ctx))
 
@@ -625,6 +652,28 @@ end
 function do_develop!(ctx::APIOptions, args::PkgArguments, api_opts::APIOptions)
     api_opts[:mode] = :develop
     API.add_or_develop(Context!(ctx), args; collect(api_opts)...)
+end
+
+# registry commands
+function do_registry_add!(ctx::APIOptions, args::PkgArguments, api_opts::APIOptions)
+    # TODO: Should accept a --depot option ?
+    Registry.add(Context!(ctx), args)
+end
+
+function do_registry_rm!(ctx::APIOptions, args::PkgArguments, api_opts::APIOptions)
+    Registry.rm(Context!(ctx), args)
+end
+
+function do_registry_up!(ctx::APIOptions, args::PkgArguments, api_opts::APIOptions)
+    if isempty(args)
+        return Registry.up(Context!(ctx))
+    else
+        return Registry.up(Context!(ctx), args)
+    end
+end
+
+function do_registry_status!(#=ctx::APIOptions,=# args::PkgArguments, api_opts::APIOptions)
+    return Registry.status()
 end
 
 ######################
@@ -713,13 +762,13 @@ end
 function complete_remote_package(s, i1, i2)
     cmp = String[]
     julia_version = VERSION
-    for reg in Types.registries(;clone_default=false)
-        data = Types.read_registry(joinpath(reg, "Registry.toml"))
+    for reg in Types.collect_registries(;clone_default=false)
+        data = Types.read_registry(joinpath(reg.path, "Registry.toml"))
         for (uuid, pkginfo) in data["packages"]
             name = pkginfo["name"]
             if startswith(name, s)
                 compat_data = Operations.load_package_data_raw(
-                    VersionSpec, joinpath(reg, pkginfo["path"], "Compat.toml"))
+                    VersionSpec, joinpath(reg.path, pkginfo["path"], "Compat.toml"))
                 supported_julia_versions = VersionSpec(VersionRange[])
                 for (ver_range, compats) in compat_data
                     for (compat, v) in compats
@@ -898,17 +947,6 @@ end
 # SPEC #
 ########
 command_declarations = [
-["registry"] => CommandDeclaration[
-(
-    CMD_REGISTRY_ADD,
-    ["add"],
-    do_registry_add!,
-    ([], identity, []),
-    [],
-    nothing,
-),
-], #registry
-
 ["package"] => CommandDeclaration[
 (   CMD_TEST,
     ["test"],
@@ -1204,6 +1242,41 @@ is modified.
     """,
 ),
 ], #package
+
+["registry"] => CommandDeclaration[
+(
+    CMD_REGISTRY_ADD,
+    ["add"],
+    do_registry_add!,
+    ([], parse_registry, [:add => true]),
+    [],
+    nothing,
+),
+(
+    CMD_REGISTRY_RM,
+    ["remove", "rm"],
+    do_registry_rm!,
+    ([], parse_registry, []),
+    [],
+    nothing,
+),
+(
+    CMD_REGISTRY_UP,
+    ["update", "up"],
+    do_registry_up!,
+    ([], parse_registry, []),
+    [],
+    nothing,
+),
+(
+    CMD_REGISTRY_STATUS,
+    ["status", "st"],
+    do_registry_status!,
+    ([], parse_registry, []),
+    [],
+    nothing,
+),
+], #registry
 ] #command_declarations
 
 super_specs = SuperSpecs(command_declarations)
